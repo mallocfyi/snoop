@@ -5,6 +5,8 @@ order, tool calls and their results, search, and filtering. Pure client-side:
 one Python script generates a self-contained HTML file and opens it. No
 server, no dependencies beyond the Python 3 standard library.
 
+![Demo: navigating the sidebar, expanding a JSON tool call, searching, and filtering](demo.gif)
+
 ## Usage
 
 ```
