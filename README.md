@@ -1,11 +1,24 @@
 # snoop
 
-Explore a Claude Code session transcript in your browser — full conversation
-order, tool calls and their results, search, and filtering. Pure client-side:
-one Python script generates a self-contained HTML file and opens it. No
-server, no dependencies beyond the Python 3 standard library.
+A searchable archive of everything you've done with Claude Code.
 
-![Demo: navigating the sidebar, expanding a JSON tool call, searching, and filtering](demo.gif)
+Every conversation is already on your disk — Claude Code writes each one to
+`~/.claude/projects/…/<guid>.jsonl` and keeps it forever. snoop turns that pile
+of JSONL into something you can actually use: search every prompt you've ever
+typed across every project, then open any session and see what the agent did,
+which files it changed, what it ran, and what it cost.
+
+One Python script, standard library only. It generates static HTML and opens it
+— no server, no dependencies, no network.
+
+![Demo: searching across sessions, opening one, and reading its summary](demo.gif)
+
+```
+python3 snoop.py          # searchable index of every session
+```
+
+Search for what you remember asking → open the session → the summary panel tells
+you what happened. That's the whole flow.
 
 ## Usage
 
