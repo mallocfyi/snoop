@@ -46,6 +46,21 @@ just what you asked. On a sample archive that's the difference between a 66 KB
 and a 1.4 MB index page; both are fine, but only the first one stays fine at
 100× the size.
 
+## Cost estimates
+
+The summary panel prices each session from the token counts Claude Code records
+per message — input, output, and separately cache reads and cache writes, since
+those bill at very different rates (a read is ~0.1× the input rate; a write
+carries a premium that depends on its TTL). In agentic sessions cache reads
+dominate everything else by orders of magnitude, so a naive
+`input_tokens × rate` calculation is wildly wrong — snoop prices all four
+buckets per model.
+
+Figures are **estimates at public list prices** (rates in `MODEL_RATES`, current
+as of 2026-08-19); a negotiated rate makes the real number lower, and
+locally-generated `<synthetic>` messages are excluded since they never hit the
+API. Edit the table in `snoop.py` if your rates differ.
+
 ## Fully offline
 
 Everything is static HTML with all data inlined — no server, no network
@@ -68,6 +83,10 @@ lazy loading).
   hover the duration to see the full span.
 
 ### Session page
+- **"What happened" summary** — a panel at the top answering the questions you
+  actually opened the transcript with: active time, prompts, tool calls, **files
+  touched**, **commands run**, tool errors, token usage, and estimated cost.
+  Every file, command, and error links straight to the moment it happened.
 - **Full transcript** — every user message, assistant response, and tool
   call/result rendered in order, grouped into conversation turns.
 - **Sidebar navigation** — one entry per prompt/response/tool call, each with

@@ -478,6 +478,177 @@ def collect_sessions(deep=False):
 
 
 # ---------------------------------------------------------------------------
+# Cost estimation
+#
+# List prices in USD per million tokens, current as of 2026-08-19. These are
+# Anthropic first-party API rates; Bedrock and Vertex bill separately, and any
+# negotiated discount makes the real figure lower. Treat the output as an
+# estimate at list price, which is what the UI labels it.
+# ---------------------------------------------------------------------------
+
+MODEL_RATES = {
+    # model id prefix:  (input $/Mtok, output $/Mtok)
+    "claude-fable-5":    (10.00, 50.00),
+    "claude-mythos-5":   (10.00, 50.00),
+    "claude-opus-5":     (5.00, 25.00),
+    "claude-opus-4-8":   (5.00, 25.00),
+    "claude-opus-4-7":   (5.00, 25.00),
+    "claude-opus-4-6":   (5.00, 25.00),
+    "claude-opus-4-5":   (5.00, 25.00),
+    "claude-sonnet-5":   (3.00, 15.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-haiku-4-5":  (1.00, 5.00),
+}
+
+# Sonnet 5 launched with introductory pricing that runs through 2026-08-31.
+# The start date isn't published, but Sonnet 5 is recent enough that every
+# session in a local archive predating the end date was billed at intro rates.
+SONNET_5_INTRO = (2.00, 10.00)
+SONNET_5_INTRO_ENDS = "2026-08-31"
+
+# Cache reads bill at ~0.1x the input rate; writes carry a premium that
+# depends on TTL - 1.25x for the 5-minute cache, 2x for the 1-hour cache.
+CACHE_READ_MULT = 0.10
+CACHE_WRITE_MULT = {"ephemeral_5m_input_tokens": 1.25, "ephemeral_1h_input_tokens": 2.00}
+
+
+def rates_for(model, timestamp=None):
+    """(input, output) $/Mtok for a model id, or None if it isn't billable.
+
+    Claude Code writes a '<synthetic>' model on locally generated messages;
+    those never hit the API and must not be priced.
+    """
+    if not model or model.startswith("<"):
+        return None
+    if model.startswith("claude-sonnet-5"):
+        if timestamp and timestamp[:10] <= SONNET_5_INTRO_ENDS:
+            return SONNET_5_INTRO
+        return MODEL_RATES["claude-sonnet-5"]
+    # Longest prefix wins, so a dated id (claude-haiku-4-5-20251001) still matches.
+    best = max((p for p in MODEL_RATES if model.startswith(p)), key=len, default=None)
+    return MODEL_RATES[best] if best else None
+
+
+def message_cost(model, usage, timestamp=None):
+    """Estimated list-price cost of one assistant message, in USD."""
+    rates = rates_for(model, timestamp)
+    if not rates:
+        return 0.0
+    inp, out = rates
+
+    creation = usage.get("cache_creation") or {}
+    write_cost = sum(
+        (creation.get(field) or 0) * inp * mult
+        for field, mult in CACHE_WRITE_MULT.items()
+    )
+    if not creation:
+        # Older logs carry only the flat total; assume the cheaper 5m tier.
+        write_cost = (usage.get("cache_creation_input_tokens") or 0) * inp * 1.25
+
+    total = (
+        (usage.get("input_tokens") or 0) * inp
+        + (usage.get("output_tokens") or 0) * out
+        + (usage.get("cache_read_input_tokens") or 0) * inp * CACHE_READ_MULT
+        + write_cost
+    )
+    return total / 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# Session summary - what actually happened
+# ---------------------------------------------------------------------------
+
+MUTATING_TOOLS = ("Edit", "Write", "NotebookEdit")
+
+
+def build_summary(events, turns):
+    """Answer the questions people open a transcript with.
+
+    Token and cost totals come from `events` so nothing is missed, while the
+    file and command lists come from `turns` because only those carry the
+    block ids the UI needs to link to.
+    """
+    tokens = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    models = {}
+    cost = 0.0
+    timestamps = []
+
+    for e in events:
+        if e.get("timestamp"):
+            timestamps.append(e["timestamp"])
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message") or {}
+        usage = msg.get("usage") or {}
+        model = msg.get("model")
+        if model:
+            models[model] = models.get(model, 0) + 1
+        tokens["input"] += usage.get("input_tokens") or 0
+        tokens["output"] += usage.get("output_tokens") or 0
+        tokens["cacheRead"] += usage.get("cache_read_input_tokens") or 0
+        tokens["cacheWrite"] += usage.get("cache_creation_input_tokens") or 0
+        cost += message_cost(model, usage, e.get("timestamp"))
+
+    files = {}
+    commands = []
+    errors = []
+    tool_counts = {}
+    n_prompts = 0
+
+    for turn in turns:
+        if turn["role"] == "user" and not turn.get("isMeta"):
+            n_prompts += 1
+        for b in turn["blocks"]:
+            if b["kind"] != "tool_call":
+                continue
+            name = b.get("name") or "tool"
+            tool_counts[name] = tool_counts.get(name, 0) + 1
+            inp = b.get("input") or {}
+            result = b.get("result")
+
+            if result and result.get("isError"):
+                errors.append({"id": b["id"], "tool": name,
+                               "preview": (result.get("content") or "")[:120]})
+
+            if name in MUTATING_TOOLS:
+                path = inp.get("file_path")
+                if path:
+                    entry = files.setdefault(path, {"path": path, "count": 0, "id": b["id"]})
+                    entry["count"] += 1
+            elif name == "Bash":
+                cmd = inp.get("command")
+                if cmd:
+                    commands.append({
+                        "id": b["id"],
+                        "cmd": " ".join(cmd.split())[:200],
+                        "description": inp.get("description") or "",
+                        "isError": bool(result and result.get("isError")),
+                    })
+
+    timestamps.sort()
+    unpriced = sorted(m for m in models if rates_for(m) is None)
+
+    return {
+        "activeMs": active_ms(timestamps),
+        "durationMs": duration_ms(timestamps[0] if timestamps else None,
+                                  timestamps[-1] if timestamps else None),
+        "start": timestamps[0] if timestamps else None,
+        "end": timestamps[-1] if timestamps else None,
+        "nPrompts": n_prompts,
+        "nToolCalls": sum(tool_counts.values()),
+        "tokens": tokens,
+        "costUsd": round(cost, 4),
+        "models": sorted(models.items(), key=lambda kv: -kv[1]),
+        "unpricedModels": unpriced,
+        "topTools": sorted(tool_counts.items(), key=lambda kv: -kv[1]),
+        "files": sorted(files.values(), key=lambda f: -f["count"]),
+        "commands": commands,
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTML generation
 # ---------------------------------------------------------------------------
 
@@ -834,6 +1005,107 @@ details.thinking .block-text {
 }
 mark.hit { background: var(--mark); color: inherit; border-radius: 2px; }
 mark.hit.current { background: var(--mark-current); }
+#summary-panel {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 10px;
+  margin-bottom: 18px;
+}
+#summary-panel > summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#summary-panel > summary::-webkit-details-marker { display: none; }
+#summary-panel > summary .chev { font-size: 9px; color: var(--text-dim); }
+#summary-panel:not([open]) > summary .chev { transform: rotate(-90deg); display: inline-block; }
+#summary-headline { font-weight: 400; color: var(--text-dim); font-family: var(--mono); font-size: 11.5px; }
+#summary-body { padding: 0 14px 14px; }
+#stat-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+}
+.tile .tile-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .tile-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.tile.warn .tile-value { color: var(--accent); }
+details.summary-section {
+  border-top: 1px solid var(--border);
+  padding: 7px 0 0;
+  margin-top: 7px;
+}
+details.summary-section > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-dim);
+  list-style: none;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+details.summary-section > summary::-webkit-details-marker { display: none; }
+details.summary-section > summary:hover { color: var(--text); }
+details.summary-section .chev { font-size: 8px; }
+details.summary-section:not([open]) .chev { transform: rotate(-90deg); display: inline-block; }
+.summary-list { margin: 7px 0 3px; padding: 0; list-style: none; max-height: 260px; overflow-y: auto; }
+.summary-list li {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  cursor: pointer;
+}
+.summary-list li:hover { background: var(--tool-bg); }
+.summary-list .count { color: var(--text-dim); flex-shrink: 0; font-size: 10.5px; }
+.summary-list .grow {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.summary-list li.is-error .grow { color: var(--accent); }
+.token-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+/* Fixed-width chips rather than stretching grid cells: when cells stretch,
+   a label sits far from its own value and reads as if paired with the next. */
+.token-grid div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 190px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.token-grid .k { color: var(--text-dim); }
+.cost-note { font-size: 11px; color: var(--text-dim); margin-top: 8px; font-style: italic; }
 #meta-panel {
   margin-top: 24px;
   border-top: 1px solid var(--border);
@@ -875,6 +1147,13 @@ mark.hit.current { background: var(--mark-current); }
       <button class="nav-btn" id="next-btn" title="Next match (Enter)">&darr;</button>
       <button class="toggle-btn" id="meta-toggle">Show session events</button>
     </div>
+    <details id="summary-panel" open>
+      <summary><span class="chev">&#9660;</span> What happened <span id="summary-headline"></span></summary>
+      <div id="summary-body">
+        <div id="stat-tiles"></div>
+        <div id="summary-sections"></div>
+      </div>
+    </details>
     <div id="turns"></div>
     <div id="meta-panel" class="hidden">
       <h3>Session events (mode changes, tool availability, snapshots, turn timings...)</h3>
@@ -1154,6 +1433,154 @@ DATA.meta.forEach(m => {
   li.textContent = (m.timestamp ? fmtTime(m.timestamp) + ' — ' : '') + '[' + m.type + '] ' + m.detail;
   metaListEl.appendChild(li);
 });
+
+// ---- Session summary ----
+
+function fmtDur(ms) {
+  if (!ms || ms < 0) return '—';
+  const m = Math.round(ms / 60000);
+  if (m < 60) return m + 'm';
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+}
+function fmtTokens(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'K';
+  return String(n);
+}
+function fmtCost(usd) {
+  if (usd >= 1) return '$' + usd.toFixed(2);
+  if (usd > 0) return '$' + usd.toFixed(3);
+  return '$0';
+}
+
+function jumpTo(blockId) {
+  const el = document.getElementById('block-' + blockId);
+  if (!el) return;
+  if (el.classList.contains('fhidden')) {
+    // The block is filtered out; re-enable its category so the jump lands.
+    activeCategories.add(el.dataset.filterKey);
+    syncFilterCheckboxes();
+    applyFilters();
+  }
+  el.scrollIntoView({ block: 'center' });
+}
+
+function statTile(value, label, opts) {
+  const d = document.createElement('div');
+  d.className = 'tile' + ((opts && opts.warn) ? ' warn' : '');
+  const v = document.createElement('div');
+  v.className = 'tile-value';
+  v.textContent = value;
+  const l = document.createElement('div');
+  l.className = 'tile-label';
+  l.textContent = label;
+  d.appendChild(v);
+  d.appendChild(l);
+  if (opts && opts.title) d.title = opts.title;
+  return d;
+}
+
+function summarySection(label, count, rows) {
+  if (!rows.length) return null;
+  const det = document.createElement('details');
+  det.className = 'summary-section';
+  const sum = document.createElement('summary');
+  sum.innerHTML = '<span class="chev">&#9660;</span> ' + escapeHtml(label) + ' (' + count + ')';
+  det.appendChild(sum);
+  const ul = document.createElement('ul');
+  ul.className = 'summary-list';
+  rows.forEach(r => ul.appendChild(r));
+  det.appendChild(ul);
+  return det;
+}
+
+function summaryRow(leftText, mainText, blockId, opts) {
+  const li = document.createElement('li');
+  if (opts && opts.isError) li.className = 'is-error';
+  if (leftText) {
+    const c = document.createElement('span');
+    c.className = 'count';
+    c.textContent = leftText;
+    li.appendChild(c);
+  }
+  const g = document.createElement('span');
+  g.className = 'grow';
+  g.textContent = mainText;
+  g.title = (opts && opts.title) || mainText;
+  li.appendChild(g);
+  if (blockId) li.addEventListener('click', () => jumpTo(blockId));
+  return li;
+}
+
+function renderSummary(s) {
+  const tiles = document.getElementById('stat-tiles');
+  const totalTokens = s.tokens.input + s.tokens.output + s.tokens.cacheRead + s.tokens.cacheWrite;
+
+  tiles.appendChild(statTile(fmtDur(s.activeMs), 'active time',
+    { title: 'Wall-clock span: ' + fmtDur(s.durationMs) }));
+  tiles.appendChild(statTile(s.nPrompts, 'prompts'));
+  tiles.appendChild(statTile(s.nToolCalls, 'tool calls'));
+  tiles.appendChild(statTile(s.files.length, 'files touched'));
+  tiles.appendChild(statTile(fmtTokens(totalTokens), 'tokens',
+    { title: fmtTokens(s.tokens.output) + ' generated, the rest read back as context' }));
+  tiles.appendChild(statTile(fmtCost(s.costUsd), 'est. cost',
+    { title: 'Estimated at public list prices' }));
+  if (s.errors.length) tiles.appendChild(statTile(s.errors.length, 'tool errors', { warn: true }));
+
+  document.getElementById('summary-headline').textContent =
+    fmtDur(s.activeMs) + ' · ' + s.nToolCalls + ' tool calls · ' + fmtCost(s.costUsd);
+
+  const sections = document.getElementById('summary-sections');
+
+  const fileRows = s.files.map(f =>
+    summaryRow(f.count > 1 ? '×' + f.count : '', f.path, f.id, { title: f.path }));
+  const filesSection = summarySection('Files touched', s.files.length, fileRows);
+  if (filesSection) sections.appendChild(filesSection);
+
+  const cmdRows = s.commands.map(c =>
+    summaryRow('', c.cmd, c.id, { title: c.description || c.cmd, isError: c.isError }));
+  const cmdSection = summarySection('Commands run', s.commands.length, cmdRows);
+  if (cmdSection) sections.appendChild(cmdSection);
+
+  const errRows = s.errors.map(e =>
+    summaryRow(e.tool, e.preview.replace(/\s+/g, ' '), e.id, { isError: true }));
+  const errSection = summarySection('Tool errors', s.errors.length, errRows);
+  if (errSection) sections.appendChild(errSection);
+
+  // Token + model breakdown
+  const det = document.createElement('details');
+  det.className = 'summary-section';
+  const sum = document.createElement('summary');
+  sum.innerHTML = '<span class="chev">&#9660;</span> Tokens &amp; cost';
+  det.appendChild(sum);
+
+  const grid = document.createElement('div');
+  grid.className = 'token-grid';
+  [['input', s.tokens.input], ['output', s.tokens.output],
+   ['cache read', s.tokens.cacheRead], ['cache write', s.tokens.cacheWrite]].forEach(([k, v]) => {
+    const row = document.createElement('div');
+    row.innerHTML = '<span class="k">' + k + '</span><span>' + v.toLocaleString() + '</span>';
+    grid.appendChild(row);
+  });
+  s.models.forEach(([name, n]) => {
+    const row = document.createElement('div');
+    row.innerHTML = '<span class="k">' + escapeHtml(name) + '</span><span>' + n + ' msg</span>';
+    grid.appendChild(row);
+  });
+  det.appendChild(grid);
+
+  const note = document.createElement('div');
+  note.className = 'cost-note';
+  let noteText = 'Estimated at public list prices — a negotiated rate makes the real figure lower.';
+  if (s.unpricedModels.length) {
+    noteText += ' Excludes ' + s.unpricedModels.join(', ') + ' (not billed).';
+  }
+  note.textContent = noteText;
+  det.appendChild(note);
+  sections.appendChild(det);
+}
+
+renderSummary(DATA.summary);
 
 // ---- Sidebar nav list ----
 
@@ -1476,13 +1903,14 @@ document.addEventListener('keydown', (e) => {
 
 
 def render_html(session_id, project_path, title, turns, meta_events, nav, category_counts,
-                tool_names, back_link=None):
+                tool_names, summary, back_link=None):
     data = json.dumps({
         "turns": turns,
         "meta": meta_events,
         "nav": nav,
         "categoryCounts": category_counts,
         "toolNames": tool_names,
+        "summary": summary,
     })
     html = HTML_TEMPLATE
     html = html.replace("__THEME_CSS__", THEME_CSS.strip())
@@ -1887,6 +2315,7 @@ def render_session_page(session_file, back_link=None):
         project_path(events, session_file.parent.name),
         session_title(events),
         turns, meta_events, nav, category_counts, tool_names,
+        build_summary(events, turns),
         back_link=back_link,
     )
 
