@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""snoop - explore a Claude Code session transcript in your browser.
+"""snoop - explore Claude Code session transcripts in your browser.
 
 Usage:
-    python3 snoop.py <guid-or-prefix>
-    python3 snoop.py            # list recent sessions to pick a guid from
+    python3 snoop.py                  # searchable index of every session on disk
+    python3 snoop.py <guid-or-prefix> # open one session
+    python3 snoop.py --deep           # index full transcripts, not just prompts
+    python3 snoop.py --list           # plain terminal listing
+
+Everything is generated as static, self-contained HTML - no server, no network.
 """
 
 import sys
 import json
-import tempfile
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+DEFAULT_OUT_DIR = Path.home() / ".snoop"
 
 
 # ---------------------------------------------------------------------------
@@ -315,16 +320,168 @@ def build_nav(turns):
 
 
 # ---------------------------------------------------------------------------
+# Cross-session inventory (for the index page)
+# ---------------------------------------------------------------------------
+
+def project_path(events, fallback_dirname):
+    """Real cwd, read from the events themselves.
+
+    The directory name encodes the cwd with '/' replaced by '-', which is
+    lossy: '-Volumes-Work-Code-malloc-mcp' could decode to either
+    '.../malloc-mcp' or '.../malloc/mcp'. Every event carries the actual cwd,
+    so prefer that and only fall back to the ambiguous decode.
+    """
+    for e in events:
+        cwd = e.get("cwd")
+        if cwd:
+            return cwd
+    return fallback_dirname.replace("-", "/")
+
+
+def session_stats(path, events):
+    """Everything the index page needs to describe and search one session."""
+    prompts = []
+    tools = {}
+    models = {}
+    timestamps = []
+    files_touched = set()
+    out_tokens = 0
+    n_tool_calls = 0
+    n_errors = 0
+
+    for e in events:
+        if e.get("timestamp"):
+            timestamps.append(e["timestamp"])
+        etype = e.get("type")
+
+        if etype == "assistant":
+            msg = e.get("message") or {}
+            if msg.get("model"):
+                models[msg["model"]] = models.get(msg["model"], 0) + 1
+            out_tokens += (msg.get("usage") or {}).get("output_tokens") or 0
+            for b in msg.get("content") or []:
+                if b.get("type") != "tool_use":
+                    continue
+                n_tool_calls += 1
+                name = b.get("name") or "tool"
+                tools[name] = tools.get(name, 0) + 1
+                if name in ("Edit", "Write", "NotebookEdit"):
+                    fp = (b.get("input") or {}).get("file_path")
+                    if fp:
+                        files_touched.add(fp)
+
+        elif etype == "user":
+            content = (e.get("message") or {}).get("content")
+            if isinstance(content, str):
+                if not e.get("isMeta") and not looks_like_local_command_artifact(content):
+                    prompts.append(content)
+            elif isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                        n_errors += 1
+
+    timestamps.sort()
+    start = timestamps[0] if timestamps else None
+    end = timestamps[-1] if timestamps else None
+
+    return {
+        "_path": str(path),  # stripped before the payload is serialized into the page
+        "guid": path.stem,
+        "project": project_path(events, path.parent.name),
+        "projectDir": path.parent.name,
+        "title": session_title(events),
+        "start": start,
+        "end": end,
+        "durationMs": duration_ms(start, end),
+        "activeMs": active_ms(timestamps),
+        "events": len(events),
+        "prompts": prompts,
+        "nPrompts": len(prompts),
+        "nToolCalls": n_tool_calls,
+        "nErrors": n_errors,
+        "filesTouched": sorted(files_touched),
+        "outTokens": out_tokens,
+        "topTools": sorted(tools.items(), key=lambda kv: -kv[1])[:4],
+        "models": sorted(models, key=lambda m: -models[m]),
+        "sizeBytes": path.stat().st_size,
+    }
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def duration_ms(start, end):
+    """Wall-clock span from first to last event."""
+    a, b = parse_ts(start or ""), parse_ts(end or "")
+    if not a or not b:
+        return None
+    return int((b - a).total_seconds() * 1000)
+
+
+IDLE_GAP_MS = 5 * 60 * 1000
+
+
+def active_ms(timestamps):
+    """Time actually spent working, ignoring idle stretches.
+
+    Wall-clock span badly overstates sessions that were resumed hours or days
+    later - a session touched on Monday and again on Wednesday spans 48h but
+    may hold 20 minutes of work. Summing only the sub-IDLE_GAP_MS gaps between
+    consecutive events approximates the real figure.
+    """
+    total = 0
+    prev = None
+    for ts in timestamps:
+        t = parse_ts(ts)
+        if t is None:
+            continue
+        if prev is not None:
+            gap = (t - prev).total_seconds() * 1000
+            if 0 <= gap <= IDLE_GAP_MS:
+                total += gap
+        prev = t
+    return int(total)
+
+
+def collect_sessions(deep=False):
+    """Load every session on disk and summarize it for the index."""
+    sessions = []
+    for path in sorted(CLAUDE_PROJECTS_DIR.glob("*/*.jsonl")):
+        try:
+            events = load_events(path)
+        except OSError:
+            continue
+        if not events:
+            continue
+        stats = session_stats(path, events)
+        if deep:
+            # Full transcript text, so the index can search assistant output
+            # and tool results too - much larger, hence opt-in.
+            turns, _ = build_transcript(events)
+            body = []
+            for turn in turns:
+                for b in turn["blocks"]:
+                    if b["kind"] in ("text", "thinking"):
+                        body.append(b["text"])
+                    elif b["kind"] == "tool_call":
+                        body.append(json.dumps(b.get("input") or {}))
+                        if b.get("result"):
+                            body.append((b["result"].get("content") or "")[:4000])
+            stats["body"] = "\n".join(body)
+        sessions.append(stats)
+    sessions.sort(key=lambda s: s.get("start") or "", reverse=True)
+    return sessions
+
+
+# ---------------------------------------------------------------------------
 # HTML generation
 # ---------------------------------------------------------------------------
 
-HTML_TEMPLATE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>snoop - __TITLE__</title>
-<style>
-:root {
+THEME_CSS = r""":root {
   --bg: #f7f7f5;
   --panel: #ffffff;
   --border: #e3e1dc;
@@ -388,6 +545,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     --badge-meta-fg: #8a8678;
   }
 }
+"""
+
+
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>snoop - __TITLE__</title>
+<style>
+__THEME_CSS__
 * { box-sizing: border-box; }
 body {
   margin: 0;
@@ -435,6 +602,14 @@ body {
   font-size: 12.5px;
   color: var(--text-dim);
 }
+#sidebar-header .back-link {
+  display: inline-block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--accent);
+  text-decoration: none;
+}
+#sidebar-header .back-link:hover { text-decoration: underline; }
 #sidebar-header .meta-line {
   margin-top: 6px;
   font-size: 11px;
@@ -674,7 +849,7 @@ mark.hit.current { background: var(--mark-current); }
 <div id="layout">
   <div id="sidebar">
     <div id="sidebar-header">
-      <div class="brand">snoop</div>
+      <div class="brand">snoop</div>__BACK_LINK__
       <div class="session-title">__TITLE_ESC__</div>
       <div class="meta-line">__SESSION_ID__</div>
       <div class="meta-line">__PROJECT_PATH__</div>
@@ -1300,7 +1475,8 @@ document.addEventListener('keydown', (e) => {
 """
 
 
-def render_html(session_id, project_path, title, turns, meta_events, nav, category_counts, tool_names):
+def render_html(session_id, project_path, title, turns, meta_events, nav, category_counts,
+                tool_names, back_link=None):
     data = json.dumps({
         "turns": turns,
         "meta": meta_events,
@@ -1309,10 +1485,15 @@ def render_html(session_id, project_path, title, turns, meta_events, nav, catego
         "toolNames": tool_names,
     })
     html = HTML_TEMPLATE
+    html = html.replace("__THEME_CSS__", THEME_CSS.strip())
     html = html.replace("__TITLE__", title.replace("</", "<\\/"))
     html = html.replace("__TITLE_ESC__", title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
     html = html.replace("__SESSION_ID__", session_id)
     html = html.replace("__PROJECT_PATH__", project_path)
+    html = html.replace(
+        "__BACK_LINK__",
+        f'\n      <a class="back-link" href="{back_link}">&larr; all sessions</a>' if back_link else "",
+    )
     html = html.replace("__DATA_JSON__", data.replace("</script>", "<\\/script>"))
     return html
 
@@ -1321,37 +1502,457 @@ def render_html(session_id, project_path, title, turns, meta_events, nav, catego
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    args = sys.argv[1:]
-    if not args:
-        list_recent_sessions()
-        return
 
-    guid = args[0]
-    session_file = find_session_file(guid)
-    if session_file is None:
-        print(f"No session found matching '{guid}' under {CLAUDE_PROJECTS_DIR}\n")
-        list_recent_sessions()
-        sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# Cross-session index page
+# ---------------------------------------------------------------------------
+
+INDEX_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>snoop - all sessions</title>
+<style>
+__THEME_CSS__
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+}
+#wrap { max-width: 1100px; margin: 0 auto; padding: 28px 24px 80px; }
+header .brand { font-weight: 700; font-size: 20px; color: var(--accent); }
+header .sub { color: var(--text-dim); font-size: 12.5px; margin-top: 4px; font-family: var(--mono); }
+#controls {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  padding: 16px 0 12px;
+  margin: 18px 0 4px;
+  border-bottom: 1px solid var(--border);
+  z-index: 5;
+}
+#search {
+  width: 100%;
+  padding: 11px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 15px;
+}
+#search:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.row2 { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+#result-count { font-size: 12px; color: var(--text-dim); margin-right: auto; }
+select {
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+.chip {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chip:hover { border-color: var(--accent); }
+.chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+#projects { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.card {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-top: 12px;
+}
+.card:hover { border-color: var(--accent); }
+.card-title { font-weight: 600; font-size: 15px; margin-bottom: 3px; }
+.card-project { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.card-meta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 8px;
+  font-family: var(--mono);
+}
+.card-tools { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+.tool-chip {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--badge-tool-bg);
+  color: var(--badge-tool-fg);
+}
+.snippets { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }
+.snippet {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 5px;
+  padding-left: 10px;
+  border-left: 2px solid var(--tool-border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.snippet .where { color: var(--accent); font-family: var(--mono); font-size: 10.5px; }
+mark { background: var(--mark); color: inherit; border-radius: 2px; }
+#empty { text-align: center; color: var(--text-dim); padding: 50px 0; font-size: 13px; }
+.hidden { display: none !important; }
+kbd {
+  font-family: var(--mono); font-size: 10.5px; border: 1px solid var(--border);
+  border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--text-dim);
+}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <div class="brand">snoop</div>
+    <div class="sub" id="header-sub"></div>
+  </header>
+
+  <div id="controls">
+    <input id="search" type="text" placeholder="Search every prompt across all sessions...  ( / to focus )" autofocus />
+    <div class="row2">
+      <span id="result-count"></span>
+      <label style="font-size:12px;color:var(--text-dim)">sort</label>
+      <select id="sort">
+        <option value="recent">Most recent</option>
+        <option value="oldest">Oldest</option>
+        <option value="longest">Longest duration</option>
+        <option value="busiest">Most tool calls</option>
+        <option value="relevance">Best match</option>
+      </select>
+    </div>
+    <div id="projects"></div>
+  </div>
+
+  <div id="results"></div>
+  <div id="empty" class="hidden">No sessions match.</div>
+</div>
+
+<script id="snoop-index-data" type="application/json">__DATA_JSON__</script>
+<script>
+const DATA = JSON.parse(document.getElementById('snoop-index-data').textContent);
+const SESSIONS = DATA.sessions;
+const DEEP = DATA.deep;
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function fmtDate(ts) {
+  if (!ts) return '—';
+  try { return new Date(ts).toLocaleDateString([], {year:'numeric', month:'short', day:'numeric'}); }
+  catch (e) { return ts; }
+}
+function fmtDuration(ms) {
+  if (!ms || ms < 0) return '—';
+  const m = Math.round(ms / 60000);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
+function shortProject(p) {
+  const parts = p.split('/').filter(Boolean);
+  return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : p;
+}
+
+// ---- project filter ----
+const allProjects = Array.from(new Set(SESSIONS.map(s => s.project))).sort();
+const activeProjects = new Set(allProjects);
+
+const projectsEl = document.getElementById('projects');
+allProjects.forEach(p => {
+  const chip = document.createElement('span');
+  chip.className = 'chip on';
+  chip.textContent = shortProject(p);
+  chip.title = p;
+  chip.addEventListener('click', () => {
+    if (activeProjects.has(p)) { activeProjects.delete(p); chip.classList.remove('on'); }
+    else { activeProjects.add(p); chip.classList.add('on'); }
+    render();
+  });
+  projectsEl.appendChild(chip);
+});
+
+document.getElementById('header-sub').textContent =
+  SESSIONS.length + ' sessions · ' + allProjects.length + ' projects · ' +
+  fmtDate(SESSIONS[SESSIONS.length - 1] && SESSIONS[SESSIONS.length - 1].start) +
+  ' – ' + fmtDate(SESSIONS[0] && SESSIONS[0].start) +
+  (DEEP ? ' · deep index' : '');
+
+// ---- search ----
+function findMatches(session, q) {
+  // Returns {count, snippets:[{where,text}]} for a lowercase query.
+  const out = { count: 0, snippets: [] };
+  const consider = [];
+  session.prompts.forEach((p, i) => consider.push(['prompt ' + (i + 1), p]));
+  if (session.title) consider.push(['title', session.title]);
+  if (DEEP && session.body) consider.push(['transcript', session.body]);
+
+  consider.forEach(([where, text]) => {
+    if (!text) return;
+    const lower = text.toLowerCase();
+    let from = 0;
+    while (true) {
+      const at = lower.indexOf(q, from);
+      if (at === -1) break;
+      out.count++;
+      if (out.snippets.length < 3) {
+        const s = Math.max(0, at - 60);
+        const e = Math.min(text.length, at + q.length + 90);
+        out.snippets.push({
+          where: where,
+          pre: (s > 0 ? '…' : '') + text.slice(s, at),
+          hit: text.slice(at, at + q.length),
+          post: text.slice(at + q.length, e) + (e < text.length ? '…' : ''),
+        });
+      }
+      from = at + q.length;
+      if (out.count > 500) break;
+    }
+  });
+  return out;
+}
+
+function card(session, matches) {
+  const a = document.createElement('a');
+  a.className = 'card';
+  a.href = 'sessions/' + session.guid + '.html';
+
+  const title = document.createElement('div');
+  title.className = 'card-title';
+  title.textContent = session.title;
+  a.appendChild(title);
+
+  const proj = document.createElement('div');
+  proj.className = 'card-project';
+  proj.textContent = session.project;
+  a.appendChild(proj);
+
+  const meta = document.createElement('div');
+  meta.className = 'card-meta';
+  const bits = [
+    [fmtDate(session.start), null],
+    // Active time, not wall-clock span: a session resumed the next day spans
+    // 24h but may hold minutes of work. Span is available on hover.
+    [fmtDuration(session.activeMs) + ' active',
+     'spans ' + fmtDuration(session.durationMs) + ' wall-clock'],
+    [session.nPrompts + ' prompts', null],
+    [session.nToolCalls + ' tool calls', null],
+  ];
+  if (session.filesTouched.length) {
+    bits.push([session.filesTouched.length + ' files touched',
+               session.filesTouched.join('\n')]);
+  }
+  if (session.nErrors) bits.push([session.nErrors + ' errors', null]);
+  bits.forEach(([text, tip]) => {
+    const s = document.createElement('span');
+    s.textContent = text;
+    if (tip) s.title = tip;
+    meta.appendChild(s);
+  });
+  a.appendChild(meta);
+
+  if (session.topTools.length) {
+    const tools = document.createElement('div');
+    tools.className = 'card-tools';
+    session.topTools.forEach(([name, n]) => {
+      const c = document.createElement('span');
+      c.className = 'tool-chip';
+      c.textContent = name + ' ×' + n;
+      c.title = name;
+      tools.appendChild(c);
+    });
+    a.appendChild(tools);
+  }
+
+  if (matches && matches.snippets.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'snippets';
+    matches.snippets.forEach(sn => {
+      const d = document.createElement('div');
+      d.className = 'snippet';
+      d.innerHTML = '<span class="where">' + escapeHtml(sn.where) + '</span>  ' +
+        escapeHtml(sn.pre) + '<mark>' + escapeHtml(sn.hit) + '</mark>' + escapeHtml(sn.post);
+      wrap.appendChild(d);
+    });
+    if (matches.count > matches.snippets.length) {
+      const more = document.createElement('div');
+      more.className = 'snippet';
+      more.style.borderLeftColor = 'transparent';
+      more.textContent = '+' + (matches.count - matches.snippets.length) + ' more matches in this session';
+      wrap.appendChild(more);
+    }
+    a.appendChild(wrap);
+  }
+  return a;
+}
+
+const searchEl = document.getElementById('search');
+const sortEl = document.getElementById('sort');
+const resultsEl = document.getElementById('results');
+const countEl = document.getElementById('result-count');
+
+function render() {
+  const q = searchEl.value.trim().toLowerCase();
+  let rows = SESSIONS
+    .filter(s => activeProjects.has(s.project))
+    .map(s => ({ s: s, m: q ? findMatches(s, q) : null }))
+    .filter(r => !q || r.m.count > 0);
+
+  const mode = sortEl.value;
+  const cmp = {
+    recent:    (a, b) => (b.s.start || '').localeCompare(a.s.start || ''),
+    oldest:    (a, b) => (a.s.start || '').localeCompare(b.s.start || ''),
+    longest:   (a, b) => (b.s.durationMs || 0) - (a.s.durationMs || 0),
+    busiest:   (a, b) => b.s.nToolCalls - a.s.nToolCalls,
+    relevance: (a, b) => ((b.m && b.m.count) || 0) - ((a.m && a.m.count) || 0),
+  }[mode];
+  rows.sort(cmp);
+
+  resultsEl.textContent = '';
+  rows.forEach(r => resultsEl.appendChild(card(r.s, r.m)));
+
+  document.getElementById('empty').classList.toggle('hidden', rows.length > 0);
+  if (q) {
+    const total = rows.reduce((n, r) => n + r.m.count, 0);
+    countEl.textContent = total + ' match' + (total === 1 ? '' : 'es') + ' in ' +
+      rows.length + ' session' + (rows.length === 1 ? '' : 's');
+  } else {
+    countEl.textContent = rows.length + ' session' + (rows.length === 1 ? '' : 's');
+  }
+}
+
+let debounce = null;
+searchEl.addEventListener('input', () => {
+  clearTimeout(debounce);
+  const wasDefault = sortEl.value === 'recent';
+  debounce = setTimeout(() => {
+    // Sorting by relevance is only meaningful once there's a query.
+    if (searchEl.value.trim() && wasDefault) sortEl.value = 'relevance';
+    if (!searchEl.value.trim() && sortEl.value === 'relevance') sortEl.value = 'recent';
+    render();
+  }, 120);
+});
+sortEl.addEventListener('change', render);
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement !== searchEl) { e.preventDefault(); searchEl.focus(); }
+});
+
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def render_index(sessions, deep):
+    public = [{k: v for k, v in s.items() if not k.startswith("_")} for s in sessions]
+    payload = json.dumps({"sessions": public, "deep": deep})
+    html = INDEX_TEMPLATE
+    html = html.replace("__THEME_CSS__", THEME_CSS.strip())
+    html = html.replace("__DATA_JSON__", payload.replace("</script>", "<\\/script>"))
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def render_session_page(session_file, back_link=None):
     events = load_events(session_file)
     turns, meta_events = build_transcript(events)
     nav, category_counts, tool_names = build_nav(turns)
-    title = session_title(events)
-    project_path = session_file.parent.name.replace("-", "/")
-
-    html = render_html(
-        session_file.stem, project_path, title,
+    return render_html(
+        session_file.stem,
+        project_path(events, session_file.parent.name),
+        session_title(events),
         turns, meta_events, nav, category_counts, tool_names,
+        back_link=back_link,
     )
 
-    out_dir = Path(tempfile.gettempdir()) / "snoop"
-    out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / f"{session_file.stem}.html"
-    out_path.write_text(html, encoding="utf-8")
 
-    print(f"Opening {out_path}")
-    webbrowser.open(f"file://{out_path}")
+def build_index(out_dir, deep=False):
+    """Write index.html plus one self-contained page per session."""
+    sessions = collect_sessions(deep=deep)
+    if not sessions:
+        print(f"No sessions found under {CLAUDE_PROJECTS_DIR}")
+        sys.exit(1)
+
+    sessions_dir = out_dir / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    for s in sessions:
+        page = render_session_page(Path(s["_path"]), back_link="../index.html")
+        (sessions_dir / f"{s['guid']}.html").write_text(page, encoding="utf-8")
+
+    index_path = out_dir / "index.html"
+    index_path.write_text(render_index(sessions, deep), encoding="utf-8")
+    return index_path, sessions
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="snoop",
+        description="Explore Claude Code session transcripts in your browser.",
+        epilog="With no guid, snoop builds a searchable index of every session on disk.",
+    )
+    parser.add_argument("guid", nargs="?",
+                        help="session guid or unique prefix; omit to build the cross-session index")
+    parser.add_argument("--deep", action="store_true",
+                        help="index full transcript text, not just prompts (larger page, searches everything)")
+    parser.add_argument("--list", dest="list_only", action="store_true",
+                        help="print recent sessions to the terminal instead of opening a page")
+    parser.add_argument("--out", metavar="DIR",
+                        help=f"output directory (default: {DEFAULT_OUT_DIR})")
+    parser.add_argument("--no-open", action="store_true",
+                        help="write the files but don't launch a browser")
+    args = parser.parse_args()
+
+    if args.list_only:
+        list_recent_sessions()
+        return
+
+    out_dir = Path(args.out).expanduser() if args.out else DEFAULT_OUT_DIR
+
+    if args.guid:
+        session_file = find_session_file(args.guid)
+        if session_file is None:
+            print(f"No session found matching '{args.guid}' under {CLAUDE_PROJECTS_DIR}\n")
+            list_recent_sessions()
+            sys.exit(1)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{session_file.stem}.html"
+        out_path.write_text(render_session_page(session_file), encoding="utf-8")
+    else:
+        out_path, sessions = build_index(out_dir, deep=args.deep)
+        total = sum(len(json.dumps(s)) for s in sessions)
+        print(f"Indexed {len(sessions)} sessions"
+              f"{' (deep)' if args.deep else ''} — search payload {total / 1024:.0f} KB")
+
+    print(f"{out_path}  ({out_path.stat().st_size / 1024:.0f} KB)")
+    if not args.no_open:
+        webbrowser.open(f"file://{out_path}")
 
 
 if __name__ == "__main__":

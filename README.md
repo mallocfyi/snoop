@@ -10,21 +10,64 @@ server, no dependencies beyond the Python 3 standard library.
 ## Usage
 
 ```
-python3 snoop.py <guid>       # open a session by its full GUID or a prefix of it
-python3 snoop.py              # list recent sessions (guid, project, title) to pick from
+python3 snoop.py              # searchable index of every session on disk
+python3 snoop.py <guid>       # open one session by GUID (or a unique prefix)
+python3 snoop.py --deep       # index full transcripts, not just prompts
+python3 snoop.py --list       # plain terminal listing
+python3 snoop.py --out DIR    # write somewhere other than ~/.snoop
+python3 snoop.py --no-open    # generate without launching a browser
 ```
+
+With no arguments, snoop builds a **cross-session index**: every session you've
+ever run, across every project, searchable by prompt. This is usually where you
+want to start — you rarely know the GUID of the session you're looking for, but
+you do remember roughly what you asked.
 
 The `<guid>` is the same session id you'd pass to `claude --resume <guid>`.
 Claude Code stores each conversation as `~/.claude/projects/<encoded-cwd>/<guid>.jsonl`;
-`snoop.py` searches all project folders for a match, so you don't need to be
-in the original working directory or know which project it belongs to. A
-unique prefix of the guid works too.
+snoop searches all project folders, so you don't need to be in the original
+working directory or know which project it belongs to.
 
-Generated pages are written to `$TMPDIR/snoop/<guid>.html` and opened with
-your default browser.
+Output goes to `~/.snoop/` (`index.html` plus one self-contained page per
+session under `sessions/`). Rebuilding the entire archive takes well under a
+second, so snoop just regenerates everything on each run — there's no cache to
+invalidate and no stale state.
+
+## Search scope: prompts vs. `--deep`
+
+By default the index searches **your prompts and session titles**. That's a
+deliberate trade: prompts are a tiny fraction of the data but the highest-signal
+text for "which session was that?", so the index stays small enough to load
+instantly no matter how large your archive grows.
+
+`--deep` additionally indexes assistant responses, tool inputs, and tool
+results — so you can find a command you ran or a line of code Claude wrote, not
+just what you asked. On a sample archive that's the difference between a 66 KB
+and a 1.4 MB index page; both are fine, but only the first one stays fine at
+100× the size.
+
+## Fully offline
+
+Everything is static HTML with all data inlined — no server, no network
+requests, no CDN, no fonts, no telemetry. Pages navigate between each other with
+ordinary relative links, so the whole thing works opened straight from disk over
+`file://` (which blocks `fetch()` to local files, hence the inlining rather than
+lazy loading).
 
 ## Features
 
+### Index page
+- **Search every prompt across every session**, with matching snippets shown
+  inline so you can see *why* a session matched before opening it.
+- **Session cards** — title, project, date, active time, prompt/tool-call
+  counts, files touched, error count, and the tools most used.
+- **Filter by project**, sort by recency, duration, tool-call volume, or
+  best match.
+- **Active time, not wall-clock span** — a session resumed the next day spans
+  24h but may hold ten minutes of work. Idle gaps over 5 minutes are excluded;
+  hover the duration to see the full span.
+
+### Session page
 - **Full transcript** — every user message, assistant response, and tool
   call/result rendered in order, grouped into conversation turns.
 - **Sidebar navigation** — one entry per prompt/response/tool call, each with
@@ -45,6 +88,7 @@ your default browser.
   snapshots, tool availability changes, turn durations.
 - **Resizable sidebar** — drag the divider to widen it (useful for long MCP
   tool names); double-click the divider to reset.
+- **Back to index** link when the page was built as part of an index.
 - Light/dark theme follows your system setting.
 
 ## Requirements
