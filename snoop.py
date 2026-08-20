@@ -327,9 +327,9 @@ def project_path(events, fallback_dirname):
     """Real cwd, read from the events themselves.
 
     The directory name encodes the cwd with '/' replaced by '-', which is
-    lossy: '-Volumes-Work-Code-malloc-mcp' could decode to either
-    '.../malloc-mcp' or '.../malloc/mcp'. Every event carries the actual cwd,
-    so prefer that and only fall back to the ambiguous decode.
+    lossy: '-home-dev-inventory-api' could decode to either '.../inventory-api'
+    or '.../inventory/api'. Every event carries the actual cwd, so prefer that
+    and only fall back to the ambiguous decode.
     """
     for e in events:
         cwd = e.get("cwd")
